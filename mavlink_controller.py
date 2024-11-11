@@ -7,11 +7,11 @@ import math
 from pymavlink import mavutil
 from scipy.optimize import fsolve
 
-connected = False
 start_mode = 'MANUAL'
 end_mode = 'HOLD'
+master = mavutil.mavlink_connection("udpin:0.0.0.0:14550")
 
-class MainController:
+class TargetController:
     def __init__(self):
         self.g_constant = 9.8065
         self.camera_height = 2
@@ -34,6 +34,7 @@ class MainController:
         self.gimbal_angle = 0
         self.target_height = 0
         self.initial_velocity = 100
+        self.connected = False
 
     def arm(self):
         master.mav.command_long_send(
@@ -121,10 +122,10 @@ class MainController:
             return(self.gimbal_angle)
         
     def calculate_target_height(self, distance, camera_height):
-        angle_radians = math.radians(float(main.calculate_gimbal_angle()))
+        angle_radians = math.radians(float(self.calculate_gimbal_angle()))
         height_difference = distance * math.tan(angle_radians)
         target_height = camera_height + height_difference
-        return(target_height)
+        return target_height
     
     def projectile_motion(self, theta, x, y, v, v_wind, dir_wind):
         theta_rad = math.radians(theta)
@@ -146,64 +147,111 @@ class MainController:
     
     def find_launch_angle(self, x, y, v, v_wind, dir_wind):
         initial_guess = 45.0
-        angle_solution = fsolve(main.projectile_motion, initial_guess, args=(x, y, v, v_wind, dir_wind))
+        angle_solution = fsolve(self.projectile_motion, initial_guess, args=(x, y, v, v_wind, dir_wind))
         theta = angle_solution[0]
         theta_rad = math.radians(theta)
         v_eff = v + v_wind * math.cos(math.radians(dir_wind))
         t_flight = (v_eff * math.sin(theta_rad) + math.sqrt((v_eff * math.sin(theta_rad))**2 + 2 * self.g_constant * y)) / self.g_constant
-        yaw_angle = main.calculate_yaw_angle(v, v_wind, dir_wind, t_flight, theta)
-        return theta, yaw_angle
-        
-main = MainController()
+        yaw_angle = self.calculate_yaw_angle(v, v_wind, dir_wind, t_flight, theta)
+        return (float(format(theta,'.1f')), yaw_angle)
 
-while not connected:
+class PIController:
+    def __init__(self, k_p, k_i):
+        self.k_p = k_p
+        self.k_i = k_i
+        self.integral = 0 #Accumulated error
+        
+    def calculate_pwm_signal(self, current_angle, target_angle, delta_time):
+        PWM_STOP = 1500
+        PWM_FULL_DOWN = 1100
+        PWM_FULL_UP = 1900
+        
+        error = float(target_angle) - float(current_angle)
+        
+        proportional = self.k_p * error
+        
+        self.integral += error * delta_time
+        integral = self.k_i * self.integral
+        
+        control_signal = proportional + integral
+        
+        if control_signal > 0:
+            pwm_signal = PWM_STOP + min(control_signal, PWM_FULL_UP - PWM_STOP)
+        elif control_signal < 0:
+            pwm_signal = PWM_STOP - min(abs(control_signal), PWM_STOP - PWM_FULL_DOWN)
+        else:
+            pwm_signal = PWM_STOP
+            
+        return int(pwm_signal)
+    
+    
+
+
+def main():
+    target = TargetController()
+    yaw_controller = PIController(k_p=2.0, k_i=0.1)
+    elevation_controller = PIController(k_p=2.0, k_i=0.1)
+    delta_time = 0.1
+    
+    while not target.connected:
+        try:
+            #master = mavutil.mavlink_connection("udpin:0.0.0.0:14550")
+            #master = mavutil.mavlink_connection("/dev/serial0", baud=921600)
+            print("Attempting connection")
+            if master.wait_heartbeat():
+                target.connected = True
+                print("Connected")
+                target.set_mode(start_mode)
+                time.sleep(2)
+                break
+        except:
+            time.sleep(1)
+            print("Waiting for connection")
+
     try:
-        master = mavutil.mavlink_connection("udpin:0.0.0.0:14550")
-        #master = mavutil.mavlink_connection("/dev/serial0", baud=921600)
-        print("Attempting connection")
-        if master.wait_heartbeat():
-            connected = True
-            print("Connected")
-            main.set_mode(start_mode)
-            time.sleep(2)
-            break
-    except:
-        time.sleep(1)
-        print("Waiting for connection")
-
-#try:
-while True:
-    values = main.read_mavlink_values()
-    if values:
-        (servo_yaw, servo_gimbal_tilt, pitch_compensation, start_aiming,
-         fire_charge, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure) = values
-        
-        # Print each variable
-#             print(f"Servo Yaw: {servo_yaw}")
-#             print(f"Servo Gimbal Tilt: {servo_gimbal_tilt}")
-#             print(f"Pitch Compensation: {pitch_compensation}")
-#             print(f"Start Aiming: {start_aiming}")
-#             print(f"Fire Charge: {fire_charge}")
-#             print(f"Roll: {roll}")
-#             print(f"Pitch: {pitch}")
-#             print(f"Yaw: {yaw}")
-#             print(f"Wind Direction: {wind_dir}")
-#             print(f"Wind Speed: {wind_spd}")
-#             print(f"Distance: {distance}")
-#             print(f"Air Pressure: {air_pressure}")
-    else:
-        print("No values returned.")
-        
-    target_height = main.calculate_target_height(float(distance), main.camera_height)
-    #print(target_height)
-        
-    if start_aiming > 1600:
-        print(distance, target_height, main.gimbal_angle)
-        launch_angle = main.find_launch_angle(float(distance), float(target_height), float(main.initial_velocity), float(wind_spd), float(wind_dir))
-        print(launch_angle)
+        while True:
+            values = target.read_mavlink_values()
+            if values:
+                (servo_yaw, servo_gimbal_tilt, pitch_compensation, start_aiming,
+                 fire_charge, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure) = values
                 
-# except:
-#     main.disarm()
-#     #main.set_servo_pwm(6, 1500)
-#     main.set_mode(end_mode)
-#     print("Script interrupted. Closing file...")
+                # Print each variable
+        #             print(f"Servo Yaw: {servo_yaw}")
+        #             print(f"Servo Gimbal Tilt: {servo_gimbal_tilt}")
+        #             print(f"Pitch Compensation: {pitch_compensation}")
+        #             print(f"Start Aiming: {start_aiming}")
+        #             print(f"Fire Charge: {fire_charge}")
+        #             print(f"Roll: {roll}")
+        #             print(f"Pitch: {pitch}")
+        #             print(f"Yaw: {yaw}")
+        #             print(f"Wind Direction: {wind_dir}")
+        #             print(f"Wind Speed: {wind_spd}")
+        #             print(f"Distance: {distance}")
+        #             print(f"Air Pressure: {air_pressure}")
+            else:
+                print("No values returned.")
+                
+            target_height = target.calculate_target_height(float(distance), target.camera_height)
+            #print(target_height)
+                
+            if start_aiming > 1600:
+                #print(distance, round(target_height,2), target.gimbal_angle)
+                launch_angle = target.find_launch_angle(float(distance), float(target_height), float(target.initial_velocity), float(wind_spd), float(wind_dir))
+                target_angle = launch_angle[0]
+                yaw_correction = launch_angle[1]
+                target_yaw = float(yaw) + float(yaw_correction)
+                #print(launch_angle, target_angle, yaw_correction)
+                yaw_pwm = yaw_controller.calculate_pwm_signal(yaw, target_yaw, delta_time)
+                elevation_pwm = elevation_controller.calculate_pwm_signal(pitch, target_angle, delta_time)
+                print(yaw_pwm, elevation_pwm)
+                target.set_servo_pwm(1, yaw_pwm)
+                target.set_servo_pwm(3, elevation_pwm)
+                        
+    except:
+        target.disarm()
+        #main.set_servo_pwm(6, 1500)
+        target.set_mode(end_mode)
+        print("Script interrupted. Closing file...")
+        
+if __name__ == "__main__":
+    main()
