@@ -49,6 +49,8 @@ class TargetController:
         self.previous_factor = 1500
         self.max_elevation_angle = 40
         self.min_elevation_angle = -5
+        self.previous_yaw_pwm = None
+        self.previous_elev_pwm = None
 
     def arm(self):
         master.mav.command_long_send(
@@ -108,6 +110,18 @@ class TargetController:
         )
         master.mav.send(servo_msg)
         return
+    
+    def update_servo_pwm(self, servo_n, microseconds, previous_pwm):
+        if microseconds != previous_pwm:
+            self.set_servo_pwm(servo_n, microseconds)
+            return microseconds
+        return previous_pwm
+    
+    def update_elev_servo_pwm(self, servo_n, microseconds, current_angle, previous_pwm):
+        if microseconds != previous_pwm:
+            self.set_elev_servo_pwm(servo_n, microseconds, current_angle)
+            return microseconds
+        return previous_pwm
 
     def read_mavlink_values(self):
         try:
@@ -353,9 +367,9 @@ def main():
             
         else:
             servo_yaw_out = yaw_in
-            target.set_servo_pwm(target.yaw_channel, servo_yaw_out)
             pitch_compensation_out = pitch_in
-            target.set_elev_servo_pwm(target.elev_channel, pitch_compensation_out,pitch)
+            target.previous_yaw_pwm = target.update_servo_pwm(target.yaw_channel, servo_yaw_out, target.previous_yaw_pwm)
+            target.previous_elev_pwm = target.update_elev_servo_pwm(target.elev_channel, pitch_compensation_out,pitch, target.previous_elev_pwm)
             
             
             #clamp manual control to min/max as well
