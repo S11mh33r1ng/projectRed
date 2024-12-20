@@ -15,7 +15,7 @@ master = mavutil.mavlink_connection("udpin:0.0.0.0:14550")
 class TargetController:
     def __init__(self):
         self.g_constant = 9.8065
-        self.camera_height = 2
+        self.camera_height = 1.715
         self.servo_yaw_out = 0
         self.servo_yaw_in = 0
         self.servo_gimbal_tilt = 0
@@ -49,6 +49,7 @@ class TargetController:
         self.previous_factor = 1500
         self.max_elevation_angle = 40
         self.min_elevation_angle = -5
+        self.initial_guess = 0
         self.previous_yaw_pwm = None
         self.previous_elev_pwm = None
 
@@ -94,11 +95,9 @@ class TargetController:
     
     def set_elev_servo_pwm(self,servo_n, microseconds,current_angle):
         if float(current_angle) < self.min_elevation_angle:
-            if microseconds > 1500:
-                microseconds = 1500
+            microseconds = 1500 if microseconds > 1500 else microseconds
         elif float(current_angle) > self.max_elevation_angle:
-            if microseconds < 1500:
-                microseconds = 1500
+            microseconds = 1500 if microseconds < 1500 else microseconds
         
         servo_msg = master.mav.command_long_encode(
             master.target_system, master.target_component,
@@ -118,7 +117,7 @@ class TargetController:
         return previous_pwm
     
     def update_elev_servo_pwm(self, servo_n, microseconds, current_angle, previous_pwm):
-        if microseconds != previous_pwm:
+        if microseconds != previous_pwm or float(current_angle) < self.min_elevation_angle or float(current_angle) > self.max_elevation_angle:
             self.set_elev_servo_pwm(servo_n, microseconds, current_angle)
             return microseconds
         return previous_pwm
@@ -143,9 +142,9 @@ class TargetController:
                 #print(servo_yaw, servo_gimbal_tilt)
             elif msg.get_type() == 'ATTITUDE':
                 att_message = msg.to_dict()
-                self.roll = format(math.degrees(att_message["roll"]), '.1f')
-                self.pitch = format(math.degrees(att_message["pitch"]),'.1f')
-                self.yaw = format(math.degrees(att_message["yaw"]), '.1f')
+                self.roll = format(math.degrees(att_message["roll"]), '.0f')
+                self.pitch = format(math.degrees(att_message["pitch"]),'.0f')
+                self.yaw = format(math.degrees(att_message["yaw"]), '.0f')
             elif msg.get_type() == 'WIND':
                 wind_message = msg.to_dict()
                 self.wind_dir = format(wind_message["direction"],'.1f')
@@ -189,7 +188,7 @@ class TargetController:
         t_flight = (v_eff * math.sin(theta_rad) + math.sqrt((v_eff * math.sin(theta_rad))**2 + 2*self.g_constant*y)) / self.g_constant
         x_adjusted = x - v_wind * math.sin(dir_wind_rad) * t_flight
         term1 = x_adjusted * math.tan(theta_rad)
-        term2 = (self.g_constant*x_adjusted**2)/(2*v_eff**2*math.cos(theta_rad)**2)
+        term2 = (self.g_constant * x_adjusted ** 2)/(2 * v_eff ** 2 * math.cos(theta_rad) ** 2)
         return term1-term2-y
     
     def calculate_yaw_angle(self, v, v_wind, dir_wind, t_flight, theta):
@@ -205,8 +204,8 @@ class TargetController:
     
     def find_launch_angle(self, x, y, v, v_wind, dir_wind):
         self.over_limit_flag = False
-        initial_guess = self.max_elevation_angle #self.max_elevation_angle
-        angle_solution = fsolve(self.projectile_motion, initial_guess, args=(x, y, v, v_wind, dir_wind))
+        #initial_guess = self.max_elevation_angle #self.max_elevation_angle
+        angle_solution = fsolve(self.projectile_motion, self.initial_guess, args=(x, y, v, v_wind, dir_wind))
         theta = angle_solution[0]
         if theta > self.max_elevation_angle or theta < self.min_elevation_angle:
             self.over_limit_flag = True
@@ -215,7 +214,7 @@ class TargetController:
         v_eff = v + v_wind * math.cos(math.radians(dir_wind))
         t_flight = (v_eff * math.sin(theta_rad) + math.sqrt((v_eff * math.sin(theta_rad))**2 + 2 * self.g_constant * y)) / self.g_constant
         yaw_angle = self.calculate_yaw_angle(v, v_wind, dir_wind, t_flight, theta)
-        return (float(format(theta,'.1f')), yaw_angle, self.over_limit_flag)
+        return (float(format(theta,'.0f')), yaw_angle, self.over_limit_flag)
     
     def calculate_exit_velocity(self, initial_velocity, correction_factor_raw):
         if correction_factor_raw == 1500:
@@ -249,8 +248,8 @@ class PIController:
         
     def calculate_pwm_signal(self, current_angle, target_angle, delta_time):
         PWM_STOP = 1500
-        PWM_FULL_DOWN = 1100
-        PWM_FULL_UP = 1900
+        PWM_FULL_DOWN = 1900
+        PWM_FULL_UP = 1100
         
         error = float(target_angle) - float(current_angle)
         
@@ -264,9 +263,9 @@ class PIController:
         control_signal = proportional + integral
         
         if control_signal > 0:
-            pwm_signal = PWM_STOP + min(control_signal, PWM_FULL_UP - PWM_STOP)
+            pwm_signal = PWM_STOP - min(control_signal, PWM_STOP - PWM_FULL_UP)
         elif control_signal < 0:
-            pwm_signal = PWM_STOP - min(abs(control_signal), PWM_STOP - PWM_FULL_DOWN)
+            pwm_signal = PWM_STOP + min(abs(control_signal), PWM_FULL_DOWN - PWM_STOP)
         else:
             pwm_signal = PWM_STOP
             
@@ -275,13 +274,12 @@ class PIController:
 def main():
     target = TargetController()
     yaw_controller = PIController(k_p=10.0, k_i=0.2, max_integral=50, decay_factor=0.99)
-    elevation_controller = PIController(k_p=20.0, k_i=0.2, max_integral=50, decay_factor=0.99)
+    elevation_controller = PIController(k_p=17.0, k_i=5.0, max_integral=50, decay_factor=0.99)
     delta_time = 0.1
     start_aiming_flag = False
     target_attitude_reached_flag = False
     ready_to_fire_flag = False
     fire_charge_flag = False
-    target.disarm()
     
     while not target.connected:
         try:
@@ -289,6 +287,8 @@ def main():
             if master.wait_heartbeat():
                 target.connected = True
                 print("Connected")
+                target.disarm()
+                time.sleep(1)
                 target.set_mode(start_mode)
                 time.sleep(2)
                 break
@@ -296,91 +296,95 @@ def main():
             time.sleep(1)
             print("Waiting for connection")
 
-    #try:
-    while True:
-        values = target.read_mavlink_values()
-        if values:
-            (servo_yaw_out, servo_gimbal_tilt, pitch_compensation_out, start_aiming_command,
-             fire_charge_input, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure,
-             charge_initial_velocity, charge_velocity_compensation, charge_type, yaw_in, pitch_in) = values
-            
-        initv = target.calculate_exit_velocity(charge_initial_velocity, charge_velocity_compensation)
-        target_height = target.calculate_target_height(float(distance), target.camera_height)
-        
-        if start_aiming_flag == True and ready_to_fire_flag == False and fire_charge_flag == False and target_attitude_reached_flag == False:
-            launch_angle = target.find_launch_angle(float(distance), float(target_height), initv, float(wind_spd), float(wind_dir))
-            target_angle = launch_angle[0]
-            yaw_correction = launch_angle[1]
-            over_limit = launch_angle[2]
-            if over_limit:
-                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, "Required elevation angle over HW limits".encode())
-                break
-            target_yaw = float(yaw) + float(yaw_correction)
-            print(pitch, target_angle, yaw_correction, over_limit)
-            yaw_pwm = yaw_controller.calculate_pwm_signal(yaw, target_yaw, delta_time)
-            elevation_pwm = elevation_controller.calculate_pwm_signal(pitch, target_angle, delta_time)
-            print(yaw_pwm, elevation_pwm)
-            print(elevation_controller.integral)
-            target.set_servo_pwm(target.yaw_channel, yaw_pwm)
-            target.set_elev_servo_pwm(target.elev_channel, elevation_pwm, pitch)
+    try:
+        while True:
             values = target.read_mavlink_values()
             if values:
                 (servo_yaw_out, servo_gimbal_tilt, pitch_compensation_out, start_aiming_command,
                  fire_charge_input, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure,
                  charge_initial_velocity, charge_velocity_compensation, charge_type, yaw_in, pitch_in) = values
-                if float(pitch) == float(target_angle) and yaw_pwm == 1500 and elevation_pwm == 1500:
-                    target.set_servo_pwm(target.yaw_channel, yaw_pwm)
-                    target.set_elev_servo_pwm(target.elev_channel, elevation_pwm, pitch)
-                    target_attitude_reached_flag = True
-                    #if air_pressure >= 0:
-                    target.arm()
-                    start_aiming_flag = False
-                    target.arm()
-                    ready_to_fire_flag = True
-        
-        elif start_aiming_command > 1800 and fire_charge_input > 1800 and ready_to_fire_flag:
-            fire_charge_flag = True
-            target.set_servo_pwm(4, 1100)
-            target.set_servo_pwm(5, 1100)
-           
-        elif target_attitude_reached_flag and ready_to_fire_flag and fire_charge_flag:
-            master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "FIRING!".encode())
-            target.set_servo_pwm(target.trigger_first_channel, 1100) #trigger actuator in
-            target.set_servo_pwm(target.trigger_second_channel, 1100) #trigger actuator in
-            time.sleep(5)
-            target.set_servo_pwm(target.trigger_first_channel, 1500) #trigger actuator out
-            target.set_servo_pwm(target.trigger_second_channel, 1500) #trigger actuator out
-            time.sleep(5)
-            target.set_servo_pwm(4, 1100)
-            target.set_servo_pwm(5, 1100)
-            target.disarm()
-            ready_to_fire_flag = False
-            start_aiming_flag = False
-            fire_charge_flag = False
-            target.disarm()
+                
+            initv = target.calculate_exit_velocity(charge_initial_velocity, charge_velocity_compensation)
+            target_height = target.calculate_target_height(float(distance), target.camera_height)
             
-        elif start_aiming_command > 1800 and not ready_to_fire_flag:
-            start_aiming_flag = True
-            target_attitude_reached_flag = False
-            target.set_servo_pwm(4, 1100)
-            target.set_servo_pwm(5, 1100)
+            if start_aiming_flag == True and ready_to_fire_flag == False and fire_charge_flag == False and target_attitude_reached_flag == False:
+                launch_angle = target.find_launch_angle(float(distance), float(target_height), initv, float(wind_spd), float(wind_dir))
+                target_angle = launch_angle[0]
+                yaw_correction = launch_angle[1]
+                over_limit = launch_angle[2]
+                if over_limit:
+                    master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, "Required elevation angle over HW limits".encode())
+                    target.set_servo_pwm(target.yaw_channel, 1500)
+                    target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
+                    break
+                target_yaw = float(yaw) + float(yaw_correction)
+                print(pitch, target_angle, yaw_correction, over_limit, target_height)
+                yaw_pwm = yaw_controller.calculate_pwm_signal(yaw, target_yaw, delta_time)
+                elevation_pwm = elevation_controller.calculate_pwm_signal(pitch, target_angle, delta_time)
+                print(yaw_pwm, elevation_pwm)
+                print(elevation_controller.integral)
+                target.set_servo_pwm(target.yaw_channel, yaw_pwm)
+                target.set_elev_servo_pwm(target.elev_channel, elevation_pwm, pitch)
+                values = target.read_mavlink_values()
+                if values:
+                    (servo_yaw_out, servo_gimbal_tilt, pitch_compensation_out, start_aiming_command,
+                     fire_charge_input, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure,
+                     charge_initial_velocity, charge_velocity_compensation, charge_type, yaw_in, pitch_in) = values
+                    if float(pitch) == float(target_angle) and 1480 < yaw_pwm < 1520 and 1480 < elevation_pwm < 1520:
+                        target.set_servo_pwm(target.yaw_channel, 1500)
+                        time.sleep(1)
+                        target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
+                        target_attitude_reached_flag = True
+                        #if air_pressure >= 0:
+                        time.sleep(1)
+                        target.arm()
+                        print("armed")
+                        start_aiming_flag = False
+                        target.arm()
+                        ready_to_fire_flag = True
             
-        else:
-            servo_yaw_out = yaw_in
-            pitch_compensation_out = pitch_in
-            target.previous_yaw_pwm = target.update_servo_pwm(target.yaw_channel, servo_yaw_out, target.previous_yaw_pwm)
-            target.previous_elev_pwm = target.update_elev_servo_pwm(target.elev_channel, pitch_compensation_out,pitch, target.previous_elev_pwm)
+            elif start_aiming_command > 1800 and fire_charge_input > 1800 and ready_to_fire_flag:
+                fire_charge_flag = True
+                target.set_servo_pwm(4, 1100)
+                target.set_servo_pwm(5, 1100)
+               
+            elif target_attitude_reached_flag and ready_to_fire_flag and fire_charge_flag:
+                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "FIRING!".encode())
+                target.set_servo_pwm(target.trigger_first_channel, 1100) #trigger actuator in
+                target.set_servo_pwm(target.trigger_second_channel, 1100) #trigger actuator in
+                time.sleep(10)
+                target.set_servo_pwm(target.trigger_first_channel, 1500) #trigger actuator out
+                target.set_servo_pwm(target.trigger_second_channel, 1500) #trigger actuator out
+                time.sleep(11)
+                target.set_servo_pwm(4, 1100)
+                target.set_servo_pwm(5, 1100)
+                target.disarm()
+                ready_to_fire_flag = False
+                start_aiming_flag = False
+                fire_charge_flag = False
+                target.disarm()
+                
+            elif start_aiming_command > 1800 and not ready_to_fire_flag:
+                start_aiming_flag = True
+                target_attitude_reached_flag = False
+                target.set_servo_pwm(4, 1100)
+                target.set_servo_pwm(5, 1100)
+                
+            else:
+                servo_yaw_out = yaw_in
+                pitch_compensation_out = pitch_in
+                target.previous_yaw_pwm = target.update_servo_pwm(target.yaw_channel, servo_yaw_out, target.previous_yaw_pwm)
+                target.previous_elev_pwm = target.update_elev_servo_pwm(target.elev_channel, pitch_compensation_out,pitch, target.previous_elev_pwm)
             
             
             #clamp manual control to min/max as well
             #create a method for shutting down the computer
             #make automatic startup
                         
-#     except:
-#         target.disarm()
-#         #main.set_servo_pwm(6, 1500)
-#         target.set_mode(end_mode)
-#         print("Script interrupted. Closing file...")
+    except:
+        target.disarm()
+        target.set_mode(end_mode)
+        print("Script interrupted. Closing file...")
         
 if __name__ == "__main__":
     main()
