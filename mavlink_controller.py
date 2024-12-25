@@ -9,8 +9,8 @@ from scipy.optimize import fsolve
 
 start_mode = 'MANUAL'
 end_mode = 'HOLD'
-master = mavutil.mavlink_connection("udpin:0.0.0.0:14550")
-#master = mavutil.mavlink_connection("/dev/serial0", baud=921600)
+#master = mavutil.mavlink_connection("udpin:0.0.0.0:14550")
+master = mavutil.mavlink_connection("/dev/serial0", baud=921600)
 
 class TargetController:
     def __init__(self):
@@ -52,6 +52,7 @@ class TargetController:
         self.initial_guess = 0
         self.previous_yaw_pwm = None
         self.previous_elev_pwm = None
+        self.triggering_time = 5
 
     def arm(self):
         master.mav.command_long_send(
@@ -324,12 +325,12 @@ def main():
                 (servo_yaw_out, servo_gimbal_tilt, pitch_compensation_out, start_aiming_command,
                  fire_charge_input, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure,
                  charge_initial_velocity, charge_velocity_compensation, charge_type, yaw_in, pitch_in) = values
+                initv = target.calculate_exit_velocity(charge_initial_velocity, charge_velocity_compensation)
             except:
                 target.connected = False
                 break
             
             if start_aiming_flag == True and ready_to_fire_flag == False and fire_charge_flag == False and target_attitude_reached_flag == False:
-                initv = target.calculate_exit_velocity(charge_initial_velocity, charge_velocity_compensation)
                 target_height = target.calculate_target_height(float(distance), target.camera_height)
                 launch_angle = target.find_launch_angle(float(distance), float(target_height), initv, float(wind_spd), float(wind_dir))
                 target_angle = launch_angle[0]
@@ -348,11 +349,6 @@ def main():
                 print(elevation_controller.integral)
                 target.set_servo_pwm(target.yaw_channel, yaw_pwm)
                 target.set_elev_servo_pwm(target.elev_channel, elevation_pwm, pitch)
-                #values = target.read_mavlink_values()
-                #if values:
-                #    (servo_yaw_out, servo_gimbal_tilt, pitch_compensation_out, start_aiming_command,
-                #     fire_charge_input, roll, pitch, yaw, wind_dir, wind_spd, distance, air_pressure,
-                #     charge_initial_velocity, charge_velocity_compensation, charge_type, yaw_in, pitch_in) = values
                 if float(pitch) == float(target_angle) and 1480 < yaw_pwm < 1520 and 1480 < elevation_pwm < 1520:
                     target.set_servo_pwm(target.yaw_channel, 1500)
                     time.sleep(1)
@@ -375,16 +371,17 @@ def main():
                 target.set_servo_pwm(target.trigger_first_channel, 1100) #trigger actuator in
                 target.set_servo_pwm(target.trigger_second_channel, 1100) #trigger actuator in
                 master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "FIRING!".encode())
-                time.sleep(10)
+                time.sleep(target.triggering_time)
                 target.set_servo_pwm(target.trigger_first_channel, 1500) #trigger actuator out
                 target.set_servo_pwm(target.trigger_second_channel, 1500) #trigger actuator out
-                time.sleep(11)
+                time.sleep(target.triggering_time + 1)
                 target.set_servo_pwm(4, 1100)
                 target.set_servo_pwm(5, 1100)
                 target.disarm()
                 ready_to_fire_flag = False
                 start_aiming_flag = False
                 fire_charge_flag = False
+                print("fired")
                 target.disarm()
                 
             elif start_aiming_command > 1800 and not ready_to_fire_flag:
