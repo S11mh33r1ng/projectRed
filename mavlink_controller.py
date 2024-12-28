@@ -16,11 +16,11 @@ class TargetController:
     def __init__(self):
         self.g_constant = 9.8065
         self.camera_height = 1.715
-        self.servo_yaw_out = 0
-        self.servo_yaw_in = 0
+        self.servo_yaw_out = 1500
+        self.servo_yaw_in = 1500
         self.servo_gimbal_tilt = 0
-        self.pitch_compensation_out = 0
-        self.servo_pitch_in = 0
+        self.pitch_compensation_out = 1500
+        self.servo_pitch_in = 1500
         self.start_aiming_command = 0
         self.fire_charge_input = 0
         self.roll = 0
@@ -44,6 +44,8 @@ class TargetController:
         self.trigger_first_channel = 6
         self.trigger_second_channel = 7
         self.corrected_velocity_channel = 12
+        self.start_aiming_channel = 4
+        self.trigger_channel = 5
         self.connected = False
         self.over_limit_flag = False
         self.previous_factor = 1500
@@ -62,6 +64,7 @@ class TargetController:
             0,
             1,0,0,0,0,0,0)
         master.motors_armed_wait()
+        master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "READY TO FIRE!".encode())
         return
 
     def disarm(self):
@@ -92,6 +95,7 @@ class TargetController:
             0,0,0,0,0     # unused parameters
         )
         master.mav.send(servo_msg)
+        #print(servo_msg)
         return
     
     def set_elev_servo_pwm(self,servo_n, microseconds,current_angle):
@@ -312,7 +316,9 @@ def main():
                 target.disarm()
                 time.sleep(1)
                 target.set_mode(start_mode)
-                time.sleep(2)
+                time.sleep(1)
+                target.set_servo_pwm(target.trigger_first_channel, 1500) #trigger actuator out
+                target.set_servo_pwm(target.trigger_second_channel, 1500) #trigger actuator out
                 break
         except:
             time.sleep(1)
@@ -331,6 +337,7 @@ def main():
                 break
             
             if start_aiming_flag == True and ready_to_fire_flag == False and fire_charge_flag == False and target_attitude_reached_flag == False:
+                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, "AIMING...".encode())
                 target_height = target.calculate_target_height(float(distance), target.camera_height)
                 launch_angle = target.find_launch_angle(float(distance), float(target_height), initv, float(wind_spd), float(wind_dir))
                 target_angle = launch_angle[0]
@@ -342,41 +349,47 @@ def main():
                     target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
                     break
                 target_yaw = float(yaw) + float(yaw_correction)
-                print(pitch, target_angle, yaw_correction, over_limit, target_height)
+                #print(pitch, target_angle, yaw_correction, over_limit, target_height)
                 yaw_pwm = yaw_controller.calculate_pwm_signal(yaw, target_yaw, delta_time)
                 elevation_pwm = elevation_controller.calculate_pwm_signal(pitch, target_angle, delta_time)
-                print(yaw_pwm, elevation_pwm)
-                print(elevation_controller.integral)
+                #print(yaw_pwm, elevation_pwm)
+                #print(elevation_controller.integral)
                 target.set_servo_pwm(target.yaw_channel, yaw_pwm)
                 target.set_elev_servo_pwm(target.elev_channel, elevation_pwm, pitch)
                 if float(pitch) == float(target_angle) and 1480 < yaw_pwm < 1520 and 1480 < elevation_pwm < 1520:
+                    master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, "AIMING DONE!".encode())
                     target.set_servo_pwm(target.yaw_channel, 1500)
                     time.sleep(1)
                     target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
                     target_attitude_reached_flag = True
-                    #if air_pressure >= 0:
-                    time.sleep(1)
-                    target.arm()
-                    print("armed")
-                    start_aiming_flag = False
-                    target.arm()
-                    ready_to_fire_flag = True
+                    if air_pressure >= 0:
+                        time.sleep(1)
+                        target.arm()
+                        start_aiming_flag = False
+                        target.arm()
+                        ready_to_fire_flag = True
+                        target.set_servo_pwm(target.start_aiming_channel, 1100)
+                        target.set_servo_pwm(target.trigger_channel, 1100)
+                        master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "READY TO FIRE!".encode())
+                        master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "READY TO FIRE!".encode())
+                        #print("ready to fire")
+                    else:
+                        master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, "Not pressurised!".encode())
+                        master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, "Not pressurised!".encode())
             
             elif start_aiming_command > 1800 and fire_charge_input > 1800 and ready_to_fire_flag:
                 fire_charge_flag = True
-                target.set_servo_pwm(4, 1100)
-                target.set_servo_pwm(5, 1100)
                
             elif target_attitude_reached_flag and ready_to_fire_flag and fire_charge_flag:
+                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_ERROR, "FIRING!".encode())
                 target.set_servo_pwm(target.trigger_first_channel, 1100) #trigger actuator in
                 target.set_servo_pwm(target.trigger_second_channel, 1100) #trigger actuator in
-                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "FIRING!".encode())
                 time.sleep(target.triggering_time)
                 target.set_servo_pwm(target.trigger_first_channel, 1500) #trigger actuator out
                 target.set_servo_pwm(target.trigger_second_channel, 1500) #trigger actuator out
                 time.sleep(target.triggering_time + 1)
-                target.set_servo_pwm(4, 1100)
-                target.set_servo_pwm(5, 1100)
+                target.set_servo_pwm(target.start_aiming_channel, 1100)
+                target.set_servo_pwm(target.trigger_channel, 1100)
                 target.disarm()
                 ready_to_fire_flag = False
                 start_aiming_flag = False
@@ -387,8 +400,6 @@ def main():
             elif start_aiming_command > 1800 and not ready_to_fire_flag:
                 start_aiming_flag = True
                 target_attitude_reached_flag = False
-                target.set_servo_pwm(4, 1100)
-                target.set_servo_pwm(5, 1100)
                 
             else:
                 servo_yaw_out = yaw_in
@@ -396,15 +407,17 @@ def main():
                 target.previous_yaw_pwm = target.update_servo_pwm(target.yaw_channel, servo_yaw_out, target.previous_yaw_pwm)
                 target.previous_elev_pwm = target.update_elev_servo_pwm(target.elev_channel, pitch_compensation_out,pitch, target.previous_elev_pwm)
             
-            
             #clamp manual control to min/max as well
             #create a method for shutting down the computer
             #make automatic startup
                         
-    except:
+    except Exception as e:
+        target.set_servo_pwm(target.yaw_channel, 1500)
+        target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
         target.disarm()
         target.set_mode(end_mode)
-        print("Script interrupted. Closing file...")
+        print(f"Error: {e}", file = sys.stderr)
+        sys.exit(1)
         
 if __name__ == "__main__":
     main()
