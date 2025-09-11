@@ -1,0 +1,126 @@
+import time, math
+from collections import deque
+import statistics as stats
+
+def angle_wrap_deg(a):  # -> [-180,180)
+    a = (a + 180.0) % 360.0 - 180.0
+    return a
+
+def circ_mean_deg(deg_list):
+    # robust circular mean (degrees)
+    s = sum(math.sin(math.radians(d)) for d in deg_list)
+    c = sum(math.cos(math.radians(d)) for d in deg_list)
+    return math.degrees(math.atan2(s, c)) % 360.0
+
+def circ_std_deg(deg_list):
+    # circular standard deviation (degrees)
+    s = sum(math.sin(math.radians(d)) for d in deg_list) / len(deg_list)
+    c = sum(math.cos(math.radians(d)) for d in deg_list) / len(deg_list)
+    R = math.hypot(s, c)
+    if R <= 0: 
+        return 180.0
+    return math.degrees(math.sqrt(-2.0 * math.log(R)))
+
+class AimingGate:
+    def __init__(self, window_sec=3.0, sample_hz=10.0,
+                 dir_thresh_deg=8.0, spd_thresh=0.8,
+                 dwell_time=1.0, deadband_deg=1.5, max_wait=6.0):
+        self.N = max(3, int(window_sec * sample_hz))
+        self.wind_dirs = deque(maxlen=self.N)  # degrees (0–360)
+        self.wind_spds = deque(maxlen=self.N)  # m/s
+        self.dir_thresh = dir_thresh_deg
+        self.spd_thresh = spd_thresh
+        self.dwell_time = dwell_time
+        self.deadband = deadband_deg
+        self.max_wait = max_wait
+        self._stable_since = None
+        self._start = None
+        self._last_cmd_heading = None
+
+    def start(self):
+        self.wind_dirs.clear(); self.wind_spds.clear()
+        self._stable_since = None
+        self._start = time.time()
+        self._last_cmd_heading = None
+
+    def update_wind(self, speed_ms, dir_deg):
+        # Optional: drop outliers by IQR or simple clamp
+        if 0 <= speed_ms < 100:
+            self.wind_spds.append(float(speed_ms))
+            self.wind_dirs.append(float(dir_deg) % 360.0)
+
+    def robust_estimate(self):
+        if not self.wind_spds or not self.wind_dirs:
+            return None
+        spd_med = stats.median(self.wind_spds)
+        dir_mean = circ_mean_deg(list(self.wind_dirs))
+        return spd_med, dir_mean
+
+    def stable(self):
+        if len(self.wind_dirs) < max(5, self.N//3):
+            return False
+        dstd = circ_std_deg(list(self.wind_dirs))
+        sstd = stats.pstdev(self.wind_spds) if len(self.wind_spds) > 1 else 0.0
+        ok = (dstd <= self.dir_thresh) and (sstd <= self.spd_thresh)
+        now = time.time()
+        if ok:
+            if self._stable_since is None:
+                self._stable_since = now
+            return (now - self._stable_since) >= self.dwell_time
+        else:
+            self._stable_since = None
+            return False
+
+    def aim_command(self, desired_heading_deg):
+        """
+        Example actuator command with hysteresis:
+        Only send a new command if the delta exceeds deadband.
+        """
+        if self._last_cmd_heading is None:
+            self._last_cmd_heading = desired_heading_deg
+            return desired_heading_deg, True
+        delta = angle_wrap_deg(desired_heading_deg - self._last_cmd_heading)
+        if abs(delta) >= self.deadband:
+            self._last_cmd_heading = (self._last_cmd_heading + delta)
+            return self._last_cmd_heading, True
+        return self._last_cmd_heading, False
+
+    def should_fire(self):
+        # stop if stable long enough, or we’ve waited too long
+        if self.stable():
+            return True, "stable"
+        if (time.time() - self._start) >= self.max_wait:
+            return True, "timeout_best_effort"
+        return False, None
+
+
+gate = AimingGate(window_sec=3.0, sample_hz=10.0,
+                  dir_thresh_deg=8.0, spd_thresh=0.8,
+                  dwell_time=1.0, deadband_deg=1.5, max_wait=6.0)
+
+gate.start()
+while True:
+    # 1) read wind sensor/estimate (m/s, coming-from heading deg)
+    wind_speed, wind_dir = read_wind()  # your function
+    gate.update_wind(wind_speed, wind_dir)
+
+    # 2) compute desired aim heading with *smoothed* wind
+    est = gate.robust_estimate()
+    if est:
+        spd_med, dir_mean = est
+        desired_heading = compute_aim_heading(dir_mean, spd_med)  # your ballistics/lead logic
+        cmd_heading, changed = gate.aim_command(desired_heading)
+        if changed:
+            set_gimbal_heading(cmd_heading)  # your actuator call
+
+    # 3) decide whether to “fire”
+    go, reason = gate.should_fire()
+    if go:
+        fire(reason)  # your action; consider logging reason
+        break
+
+    time.sleep(0.1)  # ~10 Hz
+
+
+
+
