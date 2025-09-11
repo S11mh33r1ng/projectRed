@@ -121,6 +121,195 @@ while True:
 
     time.sleep(0.1)  # ~10 Hz
 
+###Implementation
+
+1) Add these imports at top
+
+from collections import deque
+import statistics as stats
+
+2) Add helpers + the stability gate class (place after PIController)
+def _wrap_deg(a):  # -> [-180,180)
+    return (a + 180.0) % 360.0 - 180.0
+
+def _circ_mean_deg(deg_list):
+    s = sum(math.sin(math.radians(d)) for d in deg_list)
+    c = sum(math.cos(math.radians(d)) for d in deg_list)
+    return (math.degrees(math.atan2(s, c)) + 360.0) % 360.0
+
+class AimStability:
+    """
+    Smooths wind; requires small errors for a dwell time; enforces a hard timeout.
+    """
+    def __init__(self,
+                 window_sec=3.0,
+                 sample_hz=10.0,
+                 pitch_band_deg=1.0,   # how close pitch must be
+                 yaw_band_deg=2.0,     # how close yaw must be
+                 dwell_time=1.0,       # how long errors must stay small
+                 deadband_cmd_pwm=4,   # ignore tiny PWM changes
+                 max_wait=6.0):
+        self.N = max(3, int(window_sec * sample_hz))
+        self.ws = deque(maxlen=self.N)  # wind speeds
+        self.wd = deque(maxlen=self.N)  # wind dirs (deg)
+        self.pitch_band = pitch_band_deg
+        self.yaw_band = yaw_band_deg
+        self.dwell = dwell_time
+        self.deadband_pwm = deadband_cmd_pwm
+        self.max_wait = max_wait
+
+        self._stable_since = None
+        self._start = None
+        self._last_yaw_pwm = None
+        self._last_elev_pwm = None
+
+    def start(self):
+        self.ws.clear(); self.wd.clear()
+        self._stable_since = None
+        self._start = time.time()
+        self._last_yaw_pwm = None
+        self._last_elev_pwm = None
+
+    def update_wind(self, speed_ms, dir_deg):
+        # basic sanity; you can add spike rejection if needed
+        if 0 <= speed_ms < 100:
+            self.ws.append(float(speed_ms))
+            self.wd.append(float(dir_deg) % 360.0)
+
+    def robust_wind(self, cur_spd, cur_dir):
+        if self.ws and self.wd:
+            spd_med = stats.median(self.ws)
+            dir_mean = _circ_mean_deg(list(self.wd))
+            return spd_med, dir_mean
+        return cur_spd, cur_dir  # fallback
+
+    def gated(self, pitch_err_deg, yaw_err_deg):
+        ok = (abs(pitch_err_deg) <= self.pitch_band) and (abs(yaw_err_deg) <= self.yaw_band)
+        now = time.time()
+        if ok:
+            if self._stable_since is None:
+                self._stable_since = now
+            return (now - self._stable_since) >= self.dwell
+        else:
+            self._stable_since = None
+            return False
+
+    def timed_out(self):
+        return (time.time() - self._start) >= self.max_wait
+
+    def filter_pwm(self, yaw_pwm, elev_pwm):
+        # Don't resend if change is tiny (reduces micro-chatter)
+        send_yaw = True
+        send_elev = True
+
+        if self._last_yaw_pwm is not None and abs(yaw_pwm - self._last_yaw_pwm) < self.deadband_pwm:
+            send_yaw = False
+            yaw_pwm = self._last_yaw_pwm
+        if self._last_elev_pwm is not None and abs(elev_pwm - self._last_elev_pwm) < self.deadband_pwm:
+            send_elev = False
+            elev_pwm = self._last_elev_pwm
+
+        if send_yaw: self._last_yaw_pwm = yaw_pwm
+        if send_elev: self._last_elev_pwm = elev_pwm
+        return send_yaw, send_elev, yaw_pwm, elev_pwm
+
+3) Wire it into main() (init once, then use in the AIMING branch)
+
+A. Initialize right after your controllers:
+
+    delta_time = 0.1
+    gate = AimStability(window_sec=3.0,
+                        sample_hz=1.0/delta_time,
+                        pitch_band_deg=1.0,
+                        yaw_band_deg=2.0,
+                        dwell_time=1.0,
+                        deadband_cmd_pwm=4,
+                        max_wait=6.0)
+
+B. When you detect the start of aiming, also start the gate
+Replace this block (near your elif start_aiming_command > 1800 and not ready_to_fire_flag:):
+
+elif start_aiming_command > 1800 and not ready_to_fire_flag:
+    start_aiming_flag = True
+    target_attitude_reached_flag = False
+
+
+with:
+
+elif start_aiming_command > 1800 and not ready_to_fire_flag:
+    start_aiming_flag = True
+    target_attitude_reached_flag = False
+    gate.start()
+
+C. Replace the “AIMING…” branch body
+Swap your current if start_aiming_flag == True ... body with the version below. Key changes:
+
+Use robust wind for find_launch_angle
+
+Compute errors and require them to be small for a dwell time
+
+Timeout fallback
+
+PWM hysteresis on commands
+
+if start_aiming_flag and not ready_to_fire_flag and not fire_charge_flag and not target_attitude_reached_flag:
+    master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, "AIMING...".encode())
+
+    # 1) Update wind smoother
+    gate.update_wind(float(wind_spd), float(wind_dir))
+    sm_spd, sm_dir = gate.robust_wind(float(wind_spd), float(wind_dir))
+
+    # 2) Geometry with *smoothed* wind
+    target_height = target.calculate_target_height(float(distance), target.camera_height)
+    launch_angle = target.find_launch_angle(float(distance), float(target_height), initv, float(sm_spd), float(sm_dir))
+    target_angle = launch_angle[0]
+    yaw_correction = launch_angle[1]
+    over_limit = launch_angle[2]
+
+    if over_limit:
+        master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, "Target angle over HW limits".encode())
+        target.set_servo_pwm(target.yaw_channel, 1500)
+        target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
+        start_aiming_flag = False
+        # don't break main loop; just stop this aiming attempt
+    else:
+        # 3) Error signals
+        target_yaw = float(yaw) + float(yaw_correction)
+        yaw_err = _wrap_deg(target_yaw - float(yaw))
+        pitch_err = float(target_angle) - float(pitch)
+
+        # 4) Controllers -> candidate PWM
+        yaw_pwm = yaw_controller.calculate_pwm_signal(yaw, target_yaw, delta_time)
+        elev_pwm = elevation_controller.calculate_pwm_signal(pitch, target_angle, delta_time)
+
+        # 5) Hysteresis on actuator commands (don’t spam tiny changes)
+        send_yaw, send_elev, yaw_pwm, elev_pwm = gate.filter_pwm(yaw_pwm, elev_pwm)
+        if send_yaw:
+            target.set_servo_pwm(target.yaw_channel, yaw_pwm)
+        if send_elev:
+            target.set_elev_servo_pwm(target.elev_channel, elev_pwm, pitch)
+
+        # 6) Dwell-time stability or timeout -> DONE
+        if gate.gated(pitch_err, yaw_err) or gate.timed_out():
+            reason = "stable" if gate.gated(pitch_err, yaw_err) else "timeout_best_effort"
+            master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, f"AIMING DONE ({reason})".encode())
+            # stop motion
+            target.set_servo_pwm(target.yaw_channel, 1500)
+            time.sleep(1)
+            target.set_elev_servo_pwm(target.elev_channel, 1500, pitch)
+
+            target_attitude_reached_flag = True
+            if air_pressure >= 0:
+                time.sleep(1)
+                target.arm()
+                start_aiming_flag = False
+                target.arm()
+                ready_to_fire_flag = True
+                target.set_servo_pwm(target.start_aiming_channel, 1100)
+                target.set_servo_pwm(target.trigger_channel, 1100)
+                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, "READY TO FIRE!".encode())
+            else:
+                master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_WARNING, "Not pressurised!".encode())
 
 
 
